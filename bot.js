@@ -97,9 +97,6 @@ const client = new tmi.client(opts);
 client.on("message", onMessageHandler);
 client.on("connected", onConnectedHandler);
 
-// Connect to Twitch:
-client.connect();
-
 // No periodic sync needed - writes are immediate to database
 
 // Called every time a message comes in
@@ -186,11 +183,21 @@ process.on('SIGTERM', async () => {
 });
 
 async function main() {
-  console.log("Starting authentication and loading...");
-  await authenticateAndLoad().catch((error) =>
-    console.error("Error in authenticateAndLoad:", error)
-  );
-  console.log("Authentication and loading completed.");
+  try {
+    console.log("Starting authentication and loading...");
+    await authenticateAndLoad();
+    console.log("Authentication and loading completed.");
+
+    // Only connect to Twitch after database is ready
+    console.log("Connecting to Twitch...");
+    await client.connect();
+  } catch (error) {
+    console.error("Fatal error during startup:", error);
+    process.exit(1);
+  }
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error("Unhandled error:", error);
+  process.exit(1);
+});
