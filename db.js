@@ -75,6 +75,26 @@ export async function initDatabase() {
     `);
     console.log('All tables in public schema:', allTables.rows.map(r => r.table_name).join(', '));
 
+    // Show table structure
+    const tableColumns = await pool.query(`
+      SELECT column_name, data_type, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public' 
+      AND table_name = 'subscriber_commands'
+      ORDER BY ordinal_position
+    `);
+    console.log('Table structure:', JSON.stringify(tableColumns.rows, null, 2));
+
+    // Count rows
+    const rowCount = await pool.query('SELECT COUNT(*) FROM subscriber_commands');
+    console.log('Rows in table:', rowCount.rows[0].count);
+
+    // If table is empty, verify it works by trying to select from it
+    if (rowCount.rows[0].count === '0') {
+      console.log('Table is empty - this is normal for a new database');
+      console.log('Table will become visible in Neon UI once data is inserted');
+    }
+
     console.log('Database schema initialized successfully');
   } catch (error) {
     console.error('Error initializing database:', error);
@@ -102,13 +122,20 @@ export async function getCommandByName(name) {
 
 // Insert or update command (upsert)
 export async function upsertCommand(name, message, tier) {
-  const result = await pool.query(
-    `INSERT INTO subscriber_commands (name, message, tier, updated_at)
-     VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-     ON CONFLICT (name) 
-     DO UPDATE SET message = $2, tier = $3, updated_at = CURRENT_TIMESTAMP
-     RETURNING name, message, tier`,
-    [name, message, tier]
-  );
-  return result.rows[0];
+  try {
+    console.log(`[DB] upsertCommand called with: name=${name}, message=${message.substring(0, 50)}, tier=${tier}`);
+    const result = await pool.query(
+      `INSERT INTO subscriber_commands (name, message, tier, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       ON CONFLICT (name) 
+       DO UPDATE SET message = $2, tier = $3, updated_at = CURRENT_TIMESTAMP
+       RETURNING name, message, tier`,
+      [name, message, tier]
+    );
+    console.log(`[DB] upsertCommand successful, returned:`, result.rows[0]);
+    return result.rows[0];
+  } catch (error) {
+    console.error(`[DB] upsertCommand error:`, error);
+    throw error;
+  }
 }

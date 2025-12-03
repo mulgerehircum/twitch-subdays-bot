@@ -19,6 +19,22 @@ app.get("/", (req, res) => {
   res.send("Welcome to my Twitch bot!");
 });
 
+// Health check endpoint to verify database
+app.get("/health", async (req, res) => {
+  try {
+    const { pool } = await import('./db.js');
+    const result = await pool.query('SELECT COUNT(*) FROM subscriber_commands');
+    res.json({
+      status: 'ok',
+      database: 'connected',
+      table: 'subscriber_commands',
+      rowCount: parseInt(result.rows[0].count)
+    });
+  } catch (error) {
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
 // Load commands from database into cache
 async function authenticateAndLoad() {
   await initDatabase(); // Initialize database schema
@@ -107,6 +123,15 @@ async function onMessageHandler(target, context, msg, self) {
   const subTier = getSubscriberTier(badgeInfo);
   console.log(`User: ${user}, Sub Tier: ${subTier}, Badges:`, badgeInfo);
   console.log(user + " " + msg);
+
+  // Debug logging for % commands
+  if (msg.startsWith("%")) {
+    console.log(`[DEBUG] % command detected from ${user}`);
+    console.log(`[DEBUG] subscriber flag: ${subscriber}, type: ${typeof subscriber}`);
+    console.log(`[DEBUG] msg starts with %: ${msg.startsWith("%")}`);
+    console.log(`[DEBUG] condition check: ${msg.startsWith("%") && subscriber}`);
+  }
+
   const commandName = msg.trim();
   const cachedName = cachedRowsMap.get(user);
 
@@ -114,22 +139,28 @@ async function onMessageHandler(target, context, msg, self) {
     if (!cachedName) {
       try {
         await appendRow(msg, user, subTier);
-        console.log("Row appended.");
+        console.log(`Row appended for ${user}: ${msg.substring(0, 50)}`);
       } catch (error) {
-        console.error("Error appending row:", error);
+        console.error(`Error appending row for ${user}:`, error);
+        console.error('Full error:', JSON.stringify(error, null, 2));
       }
       console.log(`* Executed ${commandName} command`);
     } else if (cachedName) {
       try {
         await updateRow(msg, user, subTier);
-        console.log("Row updated.");
+        console.log(`Row updated for ${user}: ${msg.substring(0, 50)}`);
       } catch (error) {
-        console.error("Error updating row:", error);
+        console.error(`Error updating row for ${user}:`, error);
+        console.error('Full error:', JSON.stringify(error, null, 2));
       }
       console.log(`* Executed ${commandName} command`);
     } else {
       console.log(`* Unknown command ${user + " " + commandName}`);
     }
+  } else if (msg.startsWith("%") && !subscriber) {
+    console.log(`* User ${user} tried to use % command but is not a subscriber`);
+  } else if (msg.startsWith("%")) {
+    console.log(`[DEBUG] % command from ${user} did not match subscriber condition`);
   }
 }
 
