@@ -1,13 +1,27 @@
 # Twitch Subdays Bot
 
 Node.js bot that listens to Twitch chat via `tmi.js`, lets subscribers send
-a `%message`, caches it, and periodically syncs it to Google Sheets.
-
-All secrets are provided via `.env`. See `.env.example`.
+a `%message`, and stores it in PostgreSQL.
 
 ## Setup
 
+1. Install dependencies:
 ```bash
 npm install
-cp .env.example .env   # or create .env yourself
-node bot.js
+```
+
+2. Create `.env` file with the following variables:
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/dbname
+TWITCH_USERNAME=your_bot_username
+TWITCH_OAUTH=oauth:your_oauth_token
+TWITCH_CHANNELS=channel1,channel2
+PORT=8000  # optional, defaults to 8000
+```
+
+3. Run the bot:
+```bash
+npm start
+```
+
+The database table will be created automatically on first run.

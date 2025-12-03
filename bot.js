@@ -1,20 +1,12 @@
 // Ensure that we have all required environment variables
-const tmi = require("tmi.js");
-const dotenv = require("dotenv").config();
-const { GoogleSpreadsheet } = require("google-spreadsheet");
-const { JWT } = require("google-auth-library");
-let needsSync = false; // Track if the cache needs to be synced
+import 'dotenv/config';
+import tmi from "tmi.js";
+import express from "express";
+import { initDatabase, getAllCommands, upsertCommand, pool } from "./db.js";
+
 let cachedRowsMap = new Map(); // Initialize a new Map
-let lastSyncTime = Date.now();
-const SYNC_INTERVAL = 5 * 60 * 1000; // 5 minutes
-// Create JWT client for Google authentication
-const serviceAccountAuth = new JWT({
-  email: process.env.client_email,
-  key: process.env.private_key.replace(/\\n/g, "\n"), // Ensure correct key format
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
+
 //listen to port
-const express = require("express");
 const app = express();
 
 let port = process.env.PORT;
@@ -27,77 +19,24 @@ app.get("/", (req, res) => {
   res.send("Welcome to my Twitch bot!");
 });
 
-// Instantiate GoogleSpreadsheet with sheet ID and auth client
-const doc = new GoogleSpreadsheet(
-  process.env.SHEET_ID,
-  serviceAccountAuth
-);
-
-// Cache rows for faster access
+// Load commands from database into cache
 async function authenticateAndLoad() {
-  await doc.loadInfo(); // Load the document properties and worksheets
-  await cacheRows(); // Cache rows after loading the document
+  await initDatabase(); // Initialize database schema
+  await cacheRows(); // Cache rows from database
 }
 
 async function cacheRows() {
-  const sheet = doc.sheetsByIndex[1]; // Access the second sheet
-  const rows = await sheet.getRows(); // Get rows from the sheet
-  for (const row of rows) {
-    // Use rowNumber as the key and an object with name, message, and tier as the value
-    cachedRowsMap.set(row.get("name"), {
-      value: row.get("message"),
-      tier: row.get("tier") || "1", // Default to tier 1 if not set
-      row: row.rowNumber,
-    });
-  }
-}
-//sync cache with sheet
-async function syncCache() {
   try {
-    const sheet = doc.sheetsByIndex[1];
-    const rows = await sheet.getRows();
-
-    // Only get rows that have changed
-    const changes = [];
-    for (let [name, cachedRow] of cachedRowsMap) {
-      const existingRow = rows.find(row => row.get("name") === name);
-      if (!existingRow) {
-        changes.push({
-          type: 'add',
-          name,
-          value: cachedRow.value,
-          tier: cachedRow.tier
-        });
-      } else if (existingRow.get("message") !== cachedRow.value ||
-        existingRow.get("tier") !== cachedRow.tier) {
-        changes.push({
-          type: 'update',
-          row: existingRow,
-          value: cachedRow.value,
-          tier: cachedRow.tier
-        });
-      }
+    const rows = await getAllCommands();
+    for (const row of rows) {
+      cachedRowsMap.set(row.name, {
+        value: row.message,
+        tier: row.tier || "1", // Default to tier 1 if not set
+      });
     }
-
-    // Batch process changes
-    for (const change of changes) {
-      if (change.type === 'add') {
-        await sheet.addRow({
-          name: change.name,
-          message: change.value,
-          tier: change.tier
-        });
-      } else if (change.type === 'update') {
-        change.row.set("message", change.value);
-        change.row.set("tier", change.tier);
-        await change.row.save();
-      }
-    }
-
-    needsSync = false;
-    console.log(`Sync completed successfully. Processed ${changes.length} changes.`);
+    console.log(`Loaded ${rows.length} commands into cache`);
   } catch (error) {
-    console.error("Error syncing cache:", error);
+    console.error("Error caching rows:", error);
   }
 }
 
@@ -110,26 +49,31 @@ function getSubscriberTier(badgeInfo) {
   return "1";
 }
 
-//append row to the sheet
+// Insert or update command in database and cache
 async function appendRow(text, target, tier) {
   try {
+    const result = await upsertCommand(target, text, tier);
     cachedRowsMap.set(target, {
-      value: text,
-      tier: tier,
-      row: cachedRowsMap.size + 1
+      value: result.message,
+      tier: result.tier,
     });
-    needsSync = true;
   } catch (error) {
     console.error("Error appending row:", error);
+    throw error;
   }
 }
 
 async function updateRow(text, target, tier) {
-  cachedRowsMap.set(target, {
-    value: text,
-    tier: tier
-  });
-  needsSync = true;
+  try {
+    const result = await upsertCommand(target, text, tier);
+    cachedRowsMap.set(target, {
+      value: result.message,
+      tier: result.tier,
+    });
+  } catch (error) {
+    console.error("Error updating row:", error);
+    throw error;
+  }
 }
 
 //dictionary of users
@@ -156,19 +100,10 @@ client.on("connected", onConnectedHandler);
 // Connect to Twitch:
 client.connect();
 
-// Add periodic sync function
-async function periodicSync() {
-  if (needsSync && (Date.now() - lastSyncTime) > SYNC_INTERVAL) {
-    await syncCache();
-    lastSyncTime = Date.now();
-  }
-}
-
-// Start periodic sync
-setInterval(periodicSync, SYNC_INTERVAL);
+// No periodic sync needed - writes are immediate to database
 
 // Called every time a message comes in
-function onMessageHandler(target, context, msg, self) {
+async function onMessageHandler(target, context, msg, self) {
   let user = context.username;
   let subscriber = context.subscriber;
   const badgeInfo = context.badges;
@@ -181,14 +116,19 @@ function onMessageHandler(target, context, msg, self) {
   if (msg.startsWith("%") && subscriber) {
     if (!cachedName) {
       try {
-        cacheRows[target] = { value: msg };
-        appendRow(msg, user, subTier).then(() => console.log("Row appended."));
+        await appendRow(msg, user, subTier);
+        console.log("Row appended.");
       } catch (error) {
         console.error("Error appending row:", error);
       }
       console.log(`* Executed ${commandName} command`);
     } else if (cachedName) {
-      updateRow(msg, user, subTier).then(() => console.log("Row updated."));
+      try {
+        await updateRow(msg, user, subTier);
+        console.log("Row updated.");
+      } catch (error) {
+        console.error("Error updating row:", error);
+      }
       console.log(`* Executed ${commandName} command`);
     } else {
       console.log(`* Unknown command ${user + " " + commandName}`);
@@ -233,12 +173,10 @@ app.on('error', (error) => {
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Starting graceful shutdown...');
   try {
-    // Sync any pending changes
-    if (needsSync) {
-      await syncCache();
-    }
     // Disconnect from Twitch
     await client.disconnect();
+    // Close database pool
+    await pool.end();
     console.log('Graceful shutdown completed');
     process.exit(0);
   } catch (error) {
