@@ -120,6 +120,10 @@ async function onMessageHandler(target, context, msg, self) {
   let user = context.username;
   let subscriber = context.subscriber;
   const badgeInfo = context.badges;
+  // Channel name is like "#channelname", so we remove the #
+  const channelName = target.replace('#', '').toLowerCase();
+  const isBroadcaster = badgeInfo?.broadcaster === '1' || user.toLowerCase() === channelName;
+  const isMod = badgeInfo?.moderator === '1';
   const subTier = getSubscriberTier(badgeInfo);
   console.log(`User: ${user}, Sub Tier: ${subTier}, Badges:`, badgeInfo);
   console.log(user + " " + msg);
@@ -127,15 +131,15 @@ async function onMessageHandler(target, context, msg, self) {
   // Debug logging for % commands
   if (msg.startsWith("%")) {
     console.log(`[DEBUG] % command detected from ${user}`);
-    console.log(`[DEBUG] subscriber flag: ${subscriber}, type: ${typeof subscriber}`);
-    console.log(`[DEBUG] msg starts with %: ${msg.startsWith("%")}`);
-    console.log(`[DEBUG] condition check: ${msg.startsWith("%") && subscriber}`);
+    console.log(`[DEBUG] subscriber: ${subscriber}, broadcaster: ${isBroadcaster}, mod: ${isMod}`);
+    console.log(`[DEBUG] can use command: ${subscriber || isBroadcaster || isMod}`);
   }
 
   const commandName = msg.trim();
   const cachedName = cachedRowsMap.get(user);
 
-  if (msg.startsWith("%") && subscriber) {
+  // Allow subscribers, broadcaster, and mods to use % commands
+  if (msg.startsWith("%") && (subscriber || isBroadcaster || isMod)) {
     if (!cachedName) {
       try {
         await appendRow(msg, user, subTier);
@@ -157,10 +161,8 @@ async function onMessageHandler(target, context, msg, self) {
     } else {
       console.log(`* Unknown command ${user + " " + commandName}`);
     }
-  } else if (msg.startsWith("%") && !subscriber) {
-    console.log(`* User ${user} tried to use % command but is not a subscriber`);
   } else if (msg.startsWith("%")) {
-    console.log(`[DEBUG] % command from ${user} did not match subscriber condition`);
+    console.log(`* User ${user} tried to use % command but is not a subscriber, broadcaster, or mod`);
   }
 }
 
