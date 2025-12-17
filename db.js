@@ -66,6 +66,25 @@ export async function initDatabase() {
       ON subscriber_commands(tier)
     `);
 
+    // Create twitch_oauth_tokens table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS twitch_oauth_tokens (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        expires_at TIMESTAMP,
+        scope TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_twitch_oauth_tokens_username 
+      ON twitch_oauth_tokens(username)
+    `);
+
     // List all tables in public schema
     const allTables = await pool.query(`
       SELECT table_name 
@@ -136,6 +155,62 @@ export async function upsertCommand(name, message, tier) {
     return result.rows[0];
   } catch (error) {
     console.error(`[DB] upsertCommand error:`, error);
+    throw error;
+  }
+}
+
+// Get Twitch OAuth token from database
+export async function getTwitchToken() {
+  try {
+    const result = await pool.query(
+      'SELECT username, access_token, refresh_token, expires_at, scope FROM twitch_oauth_tokens ORDER BY id DESC LIMIT 1'
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error('[DB] getTwitchToken error:', error);
+    throw error;
+  }
+}
+
+// Save Twitch OAuth token to database
+export async function saveTwitchToken(username, accessToken, refreshToken, expiresAt, scope) {
+  try {
+    const result = await pool.query(
+      `INSERT INTO twitch_oauth_tokens (username, access_token, refresh_token, expires_at, scope, updated_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+       ON CONFLICT (username) 
+       DO UPDATE SET 
+         access_token = $2, 
+         refresh_token = $3, 
+         expires_at = $4, 
+         scope = $5, 
+         updated_at = CURRENT_TIMESTAMP
+       RETURNING username, access_token, refresh_token, expires_at, scope`,
+      [username, accessToken, refreshToken, expiresAt, scope]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error('[DB] saveTwitchToken error:', error);
+    throw error;
+  }
+}
+
+// Update Twitch OAuth token in database
+export async function updateTwitchToken(username, accessToken, refreshToken, expiresAt) {
+  try {
+    const result = await pool.query(
+      `UPDATE twitch_oauth_tokens 
+       SET access_token = $2, 
+           refresh_token = COALESCE($3, refresh_token), 
+           expires_at = $4, 
+           updated_at = CURRENT_TIMESTAMP
+       WHERE username = $1
+       RETURNING username, access_token, refresh_token, expires_at, scope`,
+      [username, accessToken, refreshToken, expiresAt]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error('[DB] updateTwitchToken error:', error);
     throw error;
   }
 }

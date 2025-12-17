@@ -2,20 +2,30 @@
 import 'dotenv/config';
 import tmi from "tmi.js";
 import express from "express";
-import { initDatabase, getAllCommands, upsertCommand, pool } from "./db.js";
+import { initDatabase, getAllCommands, upsertCommand, pool, getTwitchToken, saveTwitchToken, updateTwitchToken } from "./db.js";
+import crypto from "crypto";
 
 let cachedRowsMap = new Map(); // Initialize a new Map
 
+// Store OAuth state for CSRF protection
+const oauthStates = new Map();
+
 //listen to port
 const app = express();
+app.use(express.json());
 
 let port = process.env.PORT;
 if (port == null || port == "") {
-  port = 8000;
+  port = 3000;
 }
 app.listen(port);
 // After setting up your Express app
-app.get("/", (req, res) => {
+app.get("/", async (req, res) => {
+  // Handle OAuth callback if code/error parameters are present
+  if (req.query.code || req.query.error) {
+    // Redirect to callback handler
+    return res.redirect(`/auth/twitch/callback?${new URLSearchParams(req.query).toString()}`);
+  }
   res.send("Welcome to my Twitch bot!");
 });
 
@@ -32,6 +42,293 @@ app.get("/health", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
+// OAuth Token Management Functions
+function isTokenExpired(expiresAt) {
+  if (!expiresAt) return true;
+  const expiryTime = new Date(expiresAt).getTime();
+  const now = Date.now();
+  // Consider token expired if it expires within 5 minutes
+  return expiryTime - now < 5 * 60 * 1000;
+}
+
+async function refreshAccessToken(refreshToken) {
+  if (!refreshToken) {
+    throw new Error('No refresh token available');
+  }
+
+  const clientId = process.env.TWITCH_CLIENT_ID;
+  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be set in environment variables');
+  }
+
+  try {
+    const response = await fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: clientId,
+        client_secret: clientSecret,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Token refresh failed: ${response.status} ${errorText}`);
+    }
+
+    const data = await response.json();
+    return {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token || refreshToken, // Use new refresh token if provided, otherwise keep old one
+      expires_in: data.expires_in,
+    };
+  } catch (error) {
+    console.error('Error refreshing access token:', error);
+    throw error;
+  }
+}
+
+async function getValidToken() {
+  try {
+    const tokenData = await getTwitchToken();
+
+    if (!tokenData) {
+      return null;
+    }
+
+    // Check if token is expired
+    if (isTokenExpired(tokenData.expires_at)) {
+      console.log('Access token expired, refreshing...');
+
+      if (!tokenData.refresh_token) {
+        throw new Error('Token expired and no refresh token available. Please re-authenticate.');
+      }
+
+      const refreshed = await refreshAccessToken(tokenData.refresh_token);
+
+      // Calculate new expiry time
+      const expiresAt = new Date(Date.now() + refreshed.expires_in * 1000);
+
+      // Update token in database
+      await updateTwitchToken(
+        tokenData.username,
+        refreshed.access_token,
+        refreshed.refresh_token,
+        expiresAt
+      );
+
+      return {
+        username: tokenData.username,
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token,
+        expires_at: expiresAt,
+      };
+    }
+
+    return tokenData;
+  } catch (error) {
+    console.error('Error getting valid token:', error);
+    throw error;
+  }
+}
+
+// OAuth Endpoints
+app.get("/auth/twitch", (req, res) => {
+  const clientId = process.env.TWITCH_CLIENT_ID;
+  const redirectUri = process.env.TWITCH_REDIRECT_URI || `http://localhost:${port}`;
+
+  if (!clientId) {
+    return res.status(500).send('TWITCH_CLIENT_ID not configured. Please set it in your .env file.');
+  }
+
+  // Generate state for CSRF protection
+  const state = crypto.randomBytes(32).toString('hex');
+  oauthStates.set(state, { timestamp: Date.now() });
+
+  // Clean up old states (older than 10 minutes)
+  const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+  for (const [key, value] of oauthStates.entries()) {
+    if (value.timestamp < tenMinutesAgo) {
+      oauthStates.delete(key);
+    }
+  }
+
+  const scopes = 'chat:read chat:edit';
+  const authUrl = `https://id.twitch.tv/oauth2/authorize?` +
+    `client_id=${encodeURIComponent(clientId)}&` +
+    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+    `response_type=code&` +
+    `scope=${encodeURIComponent(scopes)}&` +
+    `state=${state}`;
+
+  res.redirect(authUrl);
+});
+
+app.get("/auth/twitch/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.status(400).send(`
+      <html>
+        <body>
+          <h1>Authentication Failed</h1>
+          <p>Error: ${error}</p>
+          <p><a href="/auth/twitch">Try again</a></p>
+        </body>
+      </html>
+    `);
+  }
+
+  if (!code || !state) {
+    return res.status(400).send(`
+      <html>
+        <body>
+          <h1>Authentication Failed</h1>
+          <p>Missing authorization code or state parameter.</p>
+          <p><a href="/auth/twitch">Try again</a></p>
+        </body>
+      </html>
+    `);
+  }
+
+  // Validate state
+  if (!oauthStates.has(state)) {
+    return res.status(400).send(`
+      <html>
+        <body>
+          <h1>Authentication Failed</h1>
+          <p>Invalid state parameter. This may be a CSRF attack.</p>
+          <p><a href="/auth/twitch">Try again</a></p>
+        </body>
+      </html>
+    `);
+  }
+
+  // Remove used state
+  oauthStates.delete(state);
+
+  const clientId = process.env.TWITCH_CLIENT_ID;
+  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+  const redirectUri = process.env.TWITCH_REDIRECT_URI || `http://localhost:${port}`;
+
+  if (!clientId || !clientSecret) {
+    return res.status(500).send(`
+      <html>
+        <body>
+          <h1>Server Configuration Error</h1>
+          <p>TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be set in environment variables.</p>
+        </body>
+      </html>
+    `);
+  }
+
+  try {
+    // Exchange authorization code for tokens
+    const tokenResponse = await fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code: code,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      throw new Error(`Token exchange failed: ${tokenResponse.status} ${errorText}`);
+    }
+
+    const tokenData = await tokenResponse.json();
+
+    // Validate token and get user info
+    const validateResponse = await fetch('https://id.twitch.tv/oauth2/validate', {
+      headers: {
+        'Authorization': `OAuth ${tokenData.access_token}`,
+      },
+    });
+
+    if (!validateResponse.ok) {
+      throw new Error('Token validation failed');
+    }
+
+    const userInfo = await validateResponse.json();
+    const username = userInfo.login;
+
+    // Calculate expiry time
+    const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000);
+
+    // Save token to database
+    await saveTwitchToken(
+      username,
+      tokenData.access_token,
+      tokenData.refresh_token,
+      expiresAt,
+      tokenData.scope?.join(' ') || ''
+    );
+
+    res.send(`
+      <html>
+        <body>
+          <h1>Authentication Successful!</h1>
+          <p>Twitch bot authenticated as: <strong>${username}</strong></p>
+          <p>You can now close this window. The bot will connect automatically.</p>
+          <p><a href="/auth/status">Check authentication status</a></p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    res.status(500).send(`
+      <html>
+        <body>
+          <h1>Authentication Error</h1>
+          <p>${error.message}</p>
+          <p><a href="/auth/twitch">Try again</a></p>
+        </body>
+      </html>
+    `);
+  }
+});
+
+app.get("/auth/status", async (req, res) => {
+  try {
+    const tokenData = await getTwitchToken();
+
+    if (!tokenData) {
+      return res.json({
+        authenticated: false,
+        message: 'No authentication token found. Please visit /auth/twitch to authenticate.',
+      });
+    }
+
+    const isExpired = isTokenExpired(tokenData.expires_at);
+
+    return res.json({
+      authenticated: true,
+      username: tokenData.username,
+      expires_at: tokenData.expires_at,
+      is_expired: isExpired,
+      scope: tokenData.scope,
+    });
+  } catch (error) {
+    res.status(500).json({
+      authenticated: false,
+      error: error.message,
+    });
   }
 });
 
@@ -93,25 +390,30 @@ async function updateRow(text, target, tier) {
 }
 
 //dictionary of users
-// Define configuration options
-const opts = {
-  identity: {
-    username: process.env.TWITCH_USERNAME,
-    password: process.env.TWITCH_OAUTH,
-  },
-  channels: process.env.TWITCH_CHANNELS
-    ? process.env.TWITCH_CHANNELS.split(",").map(c => c.trim())
-    : [],
-};
+// Client will be created after we have a valid token
+let client = null;
 
+// Function to initialize Twitch client with token
+function initializeClient(tokenData) {
+  const opts = {
+    identity: {
+      username: tokenData.username,
+      password: `oauth:${tokenData.access_token}`,
+    },
+    channels: process.env.TWITCH_CHANNELS
+      ? process.env.TWITCH_CHANNELS.split(",").map(c => c.trim())
+      : [],
+  };
 
-// Create a client with our options
-const client = new tmi.client(opts);
+  // Create a new client with our options
+  client = new tmi.client(opts);
 
+  // Register our event handlers
+  client.on("message", onMessageHandler);
+  client.on("connected", onConnectedHandler);
 
-// Register our event handlers (defined below)
-client.on("message", onMessageHandler);
-client.on("connected", onConnectedHandler);
+  return client;
+}
 
 // No periodic sync needed - writes are immediate to database
 
@@ -176,23 +478,50 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_DELAY = 5000; // 5 seconds
 
-client.on('disconnected', (reason) => {
-  console.log(`Disconnected: ${reason}`);
-  if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-    setTimeout(() => {
-      console.log(`Attempting to reconnect (${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
-      client.connect();
-      reconnectAttempts++;
-    }, RECONNECT_DELAY);
-  } else {
-    console.error('Max reconnection attempts reached. Please check your connection and restart the bot.');
-  }
-});
+// Setup reconnection handler (will be attached when client is created)
+function setupReconnectionHandlers() {
+  if (!client) return;
 
-client.on('connected', (addr, port) => {
-  console.log(`* Connected to ${addr}:${port}`);
-  reconnectAttempts = 0; // Reset reconnect attempts on successful connection
-});
+  client.on('disconnected', (reason) => {
+    console.log(`Disconnected: ${reason}`);
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      setTimeout(async () => {
+        console.log(`Attempting to reconnect (${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
+        try {
+          // Get valid token (refresh if needed)
+          const tokenData = await getValidToken();
+          if (!tokenData) {
+            console.error('No valid token available for reconnection');
+            return;
+          }
+
+          // Recreate client with fresh token
+          if (client) {
+            try {
+              await client.disconnect();
+            } catch (e) {
+              // Ignore disconnect errors
+            }
+          }
+
+          initializeClient(tokenData);
+          setupReconnectionHandlers();
+          await client.connect();
+          reconnectAttempts++;
+        } catch (error) {
+          console.error('Error during reconnection:', error);
+        }
+      }, RECONNECT_DELAY);
+    } else {
+      console.error('Max reconnection attempts reached. Please check your connection and restart the bot.');
+    }
+  });
+
+  client.on('connected', (addr, port) => {
+    console.log(`* Connected to ${addr}:${port}`);
+    reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+  });
+}
 
 // Add error handling for the Express server
 app.on('error', (error) => {
@@ -203,8 +532,10 @@ app.on('error', (error) => {
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Starting graceful shutdown...');
   try {
-    // Disconnect from Twitch
-    await client.disconnect();
+    // Disconnect from Twitch if client exists
+    if (client) {
+      await client.disconnect();
+    }
     // Close database pool
     await pool.end();
     console.log('Graceful shutdown completed');
@@ -221,12 +552,46 @@ async function main() {
     await authenticateAndLoad();
     console.log("Authentication and loading completed.");
 
-    // Only connect to Twitch after database is ready
+    // Get valid token from database
+    console.log("Checking for Twitch authentication token...");
+    const tokenData = await getValidToken();
+
+    if (!tokenData) {
+      const authUrl = `http://localhost:${port}/auth/twitch`;
+      console.log("=".repeat(60));
+      console.log("No Twitch authentication token found!");
+      console.log("Please visit the following URL to authenticate:");
+      console.log(authUrl);
+      console.log("=".repeat(60));
+      console.log("Bot is running and waiting for authentication...");
+      return; // Don't exit, let the server run so user can authenticate
+    }
+
+    console.log(`Authenticated as: ${tokenData.username}`);
+
+    // Initialize client with token
+    initializeClient(tokenData);
+    setupReconnectionHandlers();
+
+    // Connect to Twitch after we have a valid token
     console.log("Connecting to Twitch...");
     await client.connect();
   } catch (error) {
     console.error("Fatal error during startup:", error);
-    process.exit(1);
+
+    // If it's a token error, provide helpful message
+    if (error.message.includes('token') || error.message.includes('authentication')) {
+      const authUrl = `http://localhost:${port}/auth/twitch`;
+      console.log("=".repeat(60));
+      console.log("Authentication error. Please visit:");
+      console.log(authUrl);
+      console.log("=".repeat(60));
+    }
+
+    // Don't exit on token errors - let user authenticate via web interface
+    if (!error.message.includes('token') && !error.message.includes('authentication')) {
+      process.exit(1);
+    }
   }
 }
 
